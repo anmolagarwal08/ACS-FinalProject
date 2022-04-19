@@ -17,10 +17,6 @@ variable "env" {
   description = "Deployment Environment"
 }
 
-variable "instance_count" {
-  type    = number
-  default = "2"
-}
 
 
 

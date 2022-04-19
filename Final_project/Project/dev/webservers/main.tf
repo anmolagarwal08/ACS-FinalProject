@@ -43,38 +43,6 @@ module "globalvars" {
   source = "../../../modules/globalvars"
 }
 
-# Webserver deployment
-resource "aws_instance" "my_amazon" {
-  count                       = var.instance_count
-  ami                         = data.aws_ami.latest_amazon_linux.id
-  instance_type               = lookup(var.instance_type, var.env)
-  key_name                    = aws_key_pair.web_key.key_name
-  subnet_id                   = data.terraform_remote_state.network.outputs.private_subnet_ids[count.index]
-  security_groups             = [aws_security_group.web_sg.id]
-  associate_public_ip_address = false
-  user_data = templatefile("${path.module}/install_httpd.sh.tpl",
-    {
-      env    = upper(var.env),
-      prefix = upper(local.prefix)
-    }
-  )
-
-  root_block_device {
-    encrypted = var.env == "prod" ? true : false
-  }
-
-  lifecycle {
-    create_before_destroy = true
-  }
-
-  tags = merge(local.default_tags,
-    {
-      "Name" = "${local.name_prefix}-VM-Linux"
-    }
-  )
-}
-
-
 
 # Adding SSH key to Amazon EC2
 resource "aws_key_pair" "web_key" {
@@ -176,9 +144,90 @@ resource "aws_security_group" "lb_sg" {
   )
 }
 
-resource "aws_lb_target_group_attachment" "instance_attach" {
-  count            = length(aws_instance.my_amazon)
-  target_group_arn =aws_lb_target_group.tg.arn
-  target_id        = aws_instance.my_amazon[count.index].id
-  port             = 80
+
+# Auto Scaling launch config
+resource "aws_launch_configuration" "launch_config" {
+  name            = "web-dev"
+  image_id        = data.aws_ami.latest_amazon_linux.id
+  instance_type   = lookup(var.instance_type, var.env)
+  key_name        = aws_key_pair.web_key.key_name
+  security_groups =  [aws_security_group.web_sg.id]
+  user_data = templatefile("${path.module}/install_httpd.sh.tpl",
+    {
+      env    = upper(var.env),
+      prefix = upper(local.prefix)
+    }
+  )
+}
+
+# Auto Scaling group
+resource "aws_autoscaling_group" "asg" {
+  name                 = "asg-dev"
+  min_size             = 1
+  max_size             = 4
+  desired_capacity     = 2
+  launch_configuration = aws_launch_configuration.launch_config.name
+  vpc_zone_identifier  = data.terraform_remote_state.network.outputs.private_subnet_ids[*]
+  lifecycle {
+    ignore_changes = [desired_capacity, target_group_arns]
+  }
+
+}
+
+# Autoscaling Attachment
+resource "aws_autoscaling_attachment" "asg_attachment" {
+  autoscaling_group_name = aws_autoscaling_group.asg.id
+  lb_target_group_arn    = aws_lb_target_group.tg.arn
+}
+
+# Auto-scaling policy - scaling in
+resource "aws_autoscaling_policy" "scale_in" {
+  name                   = "scale_in"
+  autoscaling_group_name = aws_autoscaling_group.asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = -1
+  cooldown               = 300
+}
+
+# Cloud watch alarm to scale in if cpu < below 5%
+resource "aws_cloudwatch_metric_alarm" "scale_in" {
+  alarm_actions       = [aws_autoscaling_policy.scale_in.arn]
+  alarm_name          = "web_scale_in"
+  comparison_operator = "LessThanOrEqualToThreshold"
+  namespace           = "AWS/EC2"
+  metric_name         = "CPUUtilization"
+  threshold           = "5"
+  evaluation_periods  = "3"
+  period              = "300"
+  statistic           = "Average"
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.asg.name
+  }
+}
+
+# Auto-scaling policy 
+resource "aws_autoscaling_policy" "scale_out" {
+  name                   = "scale_out"
+  autoscaling_group_name = aws_autoscaling_group.asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = 1
+  cooldown               = 120
+}
+
+# Cloud watch alarm to scale out if cpu > 10%
+resource "aws_cloudwatch_metric_alarm" "scale_out" {
+  alarm_actions       = [aws_autoscaling_policy.scale_out.arn]
+  alarm_name          = "scale_out"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  namespace           = "AWS/EC2"
+  metric_name         = "CPUUtilization"
+  threshold           = "10"
+  evaluation_periods  = "3"
+  period              = "120"
+  statistic           = "Average"
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.asg.name
+  }
 }
