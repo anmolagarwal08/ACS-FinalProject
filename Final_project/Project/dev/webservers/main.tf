@@ -165,7 +165,7 @@ resource "aws_autoscaling_group" "asg" {
   name                 = "asg-dev"
   min_size             = 1
   max_size             = 4
-  desired_capacity     = 2
+  desired_capacity     = 1
   launch_configuration = aws_launch_configuration.launch_config.name
   vpc_zone_identifier  = data.terraform_remote_state.network.outputs.private_subnet_ids[*]
   lifecycle {
@@ -231,3 +231,52 @@ resource "aws_cloudwatch_metric_alarm" "scale_out" {
     AutoScalingGroupName = aws_autoscaling_group.asg.name
   }
 }
+
+
+
+
+
+
+
+######
+
+# Webserver deployment
+resource "aws_instance" "my_amazon" {
+  count                       = var.instance_count
+  ami                         = data.aws_ami.latest_amazon_linux.id
+  instance_type               = lookup(var.instance_type, var.env)
+  key_name                    = aws_key_pair.web_key.key_name
+  subnet_id                   = data.terraform_remote_state.network.outputs.private_subnet_ids[count.index]
+  security_groups             = [aws_security_group.web_sg.id]
+  associate_public_ip_address = false
+  user_data = templatefile("${path.module}/install_httpd.sh.tpl",
+    {
+      env    = upper(var.env),
+      prefix = upper(local.prefix)
+    }
+  )
+
+  root_block_device {
+    encrypted = var.env == "prod" ? true : false
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = merge(local.default_tags,
+    {
+      "Name" = "${local.name_prefix}-VM-Linux"
+    }
+  )
+}
+
+
+
+resource "aws_lb_target_group_attachment" "instance_attach" {
+  count            = length(aws_instance.my_amazon)
+  target_group_arn =aws_lb_target_group.tg.arn
+  target_id        = aws_instance.my_amazon[count.index].id
+  port             = 80
+}
+
